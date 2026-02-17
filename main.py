@@ -44,11 +44,11 @@ def read_root():
 def get_stock_screener(
     sector: Optional[str] = None,
     status: Optional[str] = None,
-    sort: str = "ticker", # Tambah parameter ini
-    limit: int = 100
+    sort: str = "ticker", # <--- Kita tambah parameter ini
+    limit: int = 200 # Kita naikkan limit default biar listnya panjang
 ):
     try:
-        # Select data yang dibutuhkan untuk tabel
+        # Select data lengkap untuk tabel
         query = supabase.table("stocks").select(
             "ticker, company_name, sector, logo_url, "
             "last_price, change_pct, "
@@ -56,16 +56,19 @@ def get_stock_screener(
             "graham_number, margin_of_safety, valuation_status"
         )
 
+        # Filter logic
         if sector:
             query = query.eq("sector", sector)
         if status:
             query = query.eq("valuation_status", status)
             
-        # LOGIKA SORTING
+        # SORTING LOGIC
         if sort == "ticker":
-            query = query.order("ticker", desc=False) # A-Z
+            # Urutkan A-Z (Default permintaan Anda)
+            query = query.order("ticker", desc=False)
         elif sort == "mos":
-            query = query.order("margin_of_safety", desc=True) # Diskon terbesar
+            # Urutkan berdasarkan diskon terbesar
+            query = query.order("margin_of_safety", desc=True)
             
         response = query.limit(limit).execute()
         return {"data": response.data, "count": len(response.data)}
