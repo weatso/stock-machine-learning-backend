@@ -5,6 +5,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import yfinance as yf
+import pandas as pd
 
 # --- KONFIGURASI ---
 load_dotenv()
@@ -44,31 +46,37 @@ def read_root():
 def get_stock_screener(
     sector: Optional[str] = None,
     status: Optional[str] = None,
-    sort: str = "ticker", # <--- Kita tambah parameter ini
-    limit: int = 200 # Kita naikkan limit default biar listnya panjang
+    sort_by: str = "ticker",    # Field yang mau disort
+    sort_order: str = "asc",    # Arah: 'asc' atau 'desc'
+    limit: int = 1000
 ):
     try:
-        # Select data lengkap untuk tabel
-        query = supabase.table("stocks").select(
-            "ticker, company_name, sector, logo_url, "
-            "last_price, change_pct, "
-            "eps_ttm, bvps, "
-            "graham_number, margin_of_safety, valuation_status"
-        )
+        # Mapping dari Frontend ke Kolom Database
+        sort_map = {
+            "ticker": "ticker",
+            "company_name": "company_name",
+            "sector": "sector",
+            "last_price": "last_price",
+            "graham_number": "graham_number",
+            "margin_of_safety": "margin_of_safety",
+            "change_pct": "change_pct"
+        }
+        
+        # Ambil nama kolom asli, default ke ticker jika tidak ketemu
+        db_column = sort_map.get(sort_by, "ticker")
+        is_desc = (sort_order.lower() == "desc")
 
-        # Filter logic
+        query = supabase.table("stocks").select("*")
+
+        # Filter
         if sector:
             query = query.eq("sector", sector)
         if status:
             query = query.eq("valuation_status", status)
             
-        # SORTING LOGIC
-        if sort == "ticker":
-            # Urutkan A-Z (Default permintaan Anda)
-            query = query.order("ticker", desc=False)
-        elif sort == "mos":
-            # Urutkan berdasarkan diskon terbesar
-            query = query.order("margin_of_safety", desc=True)
+        # Sorting Dinamis
+        # Supabase Python client menggunakan .order(column, desc=True/False)
+        query = query.order(db_column, desc=is_desc)
             
         response = query.limit(limit).execute()
         return {"data": response.data, "count": len(response.data)}
@@ -92,23 +100,36 @@ def get_stock_detail(ticker: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stocks/{ticker}/chart")
-def get_stock_chart(ticker: str, timeframe: str = "D"):
+def get_stock_chart(ticker: str, timeframe: str = "5y"): 
     """
-    Proxy Teknikal Chart.
-    Data langsung ditembak ke Invezgo (Realtime) agar tidak membebani database kita.
+    Mengambil data OHLCV historis dari Yahoo Finance.
+    Timeframe: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
     """
     try:
-        # URL Invezgo untuk history chart (sesuai dokumentasi api-1.json)
-        # Endpoint: /analysis/history?ticker={ticker}&interval={timeframe}
-        url = f"https://api.invezgo.com/analysis/history?ticker={ticker.upper()}&interval={timeframe}"
-        headers = {"Authorization": f"Bearer {INVEZGO_KEY}"}
+        # Tambahkan .JK
+        symbol = f"{ticker.upper()}.JK"
+        stock = yf.Ticker(symbol)
         
-        res = requests.get(url, headers=headers)
+        # Ambil history "sejauh mungkin" sesuai request (max)
+        # Atau default '5y' biar chart enak dilihat
+        hist = stock.history(period=timeframe)
         
-        if res.status_code != 200:
-             raise HTTPException(status_code=res.status_code, detail="Gagal ambil chart dari Invezgo")
-             
-        return res.json()
+        # Reset index agar Date menjadi kolom
+        hist.reset_index(inplace=True)
+        
+        # Format ke JSON array yang bersih untuk Recharts/TradingView
+        chart_data = []
+        for _, row in hist.iterrows():
+            chart_data.append({
+                "time": row['Date'].strftime('%Y-%m-%d'), # Format YYYY-MM-DD
+                "open": row['Open'],
+                "high": row['High'],
+                "low": row['Low'],
+                "close": row['Close'],
+                "volume": row['Volume']
+            })
+            
+        return chart_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -126,3 +147,76 @@ def get_sectors():
         return {"sectors": sorted(sectors)}
     except Exception as e:
          raise HTTPException(status_code=500, detail=str(e))
+
+# --- TAMBAHKAN DI BAGIAN BAWAH MAIN.PY ---
+
+@app.get("/stats/dashboard-widgets")
+def get_dashboard_widgets():
+    """
+    Satu endpoint untuk semua widget dashboard biar cepat loadingnya.
+    Mengembalikan: Graham Radar, Gainers, Losers, dan AI Insight.
+    """
+    try:
+        # 1. GRAHAM RADAR (5 Saham Undervalued dengan MOS Tertinggi, Liquid Only)
+        # Filter: Undervalued, Volume > 1M (biar ga saham gorengan sepi), Urutkan MOS
+        radar = supabase.table("stocks")\
+            .select("ticker, company_name, last_price, margin_of_safety, change_pct")\
+            .eq("valuation_status", "Undervalued")\
+            .gt("daily_volume", 1000000)\
+            .order("margin_of_safety", desc=True)\
+            .limit(5)\
+            .execute().data
+
+        # 2. TOP GAINERS (5 Saham)
+        gainers = supabase.table("stocks")\
+            .select("ticker, last_price, change_pct")\
+            .order("change_pct", desc=True)\
+            .limit(5)\
+            .execute().data
+
+        # 3. TOP LOSERS (5 Saham)
+        losers = supabase.table("stocks")\
+            .select("ticker, last_price, change_pct")\
+            .order("change_pct", desc=False)\
+            .limit(5)\
+            .execute().data
+
+        # 4. "AI" INSIGHT GENERATOR (Analisis Data Statistik)
+        # Kita hitung statistik sederhana untuk membuat kalimat 'pintar'
+        stats = supabase.table("stocks").select("valuation_status, change_pct").execute().data
+        
+        total_stocks = len(stats)
+        undervalued_count = sum(1 for s in stats if s.get('valuation_status') == 'Undervalued')
+        green_stocks = sum(1 for s in stats if (s.get('change_pct') or 0) > 0)
+        
+        # Logika Kalimat AI
+        sentiment = "Netral"
+        if green_stocks > (total_stocks / 2):
+            sentiment = "Bullish (Optimis)"
+        else:
+            sentiment = "Bearish (Pesimis)"
+
+        insight_text = (
+            f"Pasar saat ini cenderung {sentiment}. "
+            f"Terdeteksi {undervalued_count} saham yang berada di area 'Undervalued' menurut perhitungan Graham. "
+            f"Ini adalah {(undervalued_count/total_stocks)*100:.1f}% dari total pasar. "
+        )
+
+        if undervalued_count > (total_stocks * 0.3):
+             insight_text += "Saat ini adalah waktu yang menarik untuk Value Investing karena banyak saham diskon."
+        else:
+             insight_text += "Pasar relatif mahal, berhati-hatilah dalam memilih saham."
+
+        return {
+            "radar": radar,
+            "gainers": gainers,
+            "losers": losers,
+            "insight": {
+                "text": insight_text,
+                "sentiment": sentiment,
+                "undervalued_count": undervalued_count
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

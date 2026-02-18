@@ -1,0 +1,97 @@
+import time
+import yfinance as yf
+import pandas as pd
+from utils import supabase, get_all_tickers
+
+def update_market_yfinance():
+    tickers = get_all_tickers()
+    total = len(tickers)
+    print(f"📈 [YFINANCE WORKER] Update Harga untuk {total} saham...")
+    
+    # Ambil Graham Number dari DB untuk hitung MOS
+    try:
+        db_data = supabase.table("stocks").select("ticker, graham_number").execute().data
+        stock_map = {item['ticker']: item for item in db_data}
+    except Exception as e:
+        print(f"❌ Gagal ambil cache database: {e}")
+        stock_map = {}
+
+    # Proses dalam BATCH (Kelompok) agar ngebut
+    BATCH_SIZE = 50 
+    
+    for i in range(0, total, BATCH_SIZE):
+        batch_tickers = tickers[i:i+BATCH_SIZE]
+        # Format ke simbol Yahoo: BBCA -> BBCA.JK
+        yf_symbols = [f"{t}.JK" for t in batch_tickers]
+        
+        print(f"🔄 Fetching Batch {i+1}-{min(i+BATCH_SIZE, total)}...", end=" ")
+        
+        try:
+            # Download data hari ini (period='1d') untuk semua saham di batch ini
+            # group_by='ticker' agar strukturnya mudah
+            data = yf.download(yf_symbols, period="1d", group_by='ticker', progress=False, threads=True)
+            
+            updates = []
+            
+            for ticker in batch_tickers:
+                symbol = f"{ticker}.JK"
+                
+                try:
+                    # Cek apakah data untuk ticker ini ada
+                    # Pandas DataFrame agak tricky, kita perlu handle error key
+                    if symbol in data.columns.levels[0]:
+                        stock_data = data[symbol]
+                    elif len(batch_tickers) == 1: # Jika cuma 1 ticker, strukturnya beda
+                        stock_data = data
+                    else:
+                        continue # Skip jika data tidak ditemukan
+                        
+                    # Ambil baris terakhir (data hari ini)
+                    if stock_data.empty: continue
+                    last_row = stock_data.iloc[-1]
+                    
+                    # Extract Data
+                    price = float(last_row['Close'])
+                    vol = int(last_row['Volume'])
+                    # Yahoo kadang tidak kasih Market Cap di history, 
+                    # jadi untuk Market Cap akurat mending tetap dari Fundamental/Invezgo atau hitung manual (Price * Shares Outstanding)
+                    # Di sini kita fokus update HARGA dan VOLUME dulu.
+                    
+                    # Hitung MOS
+                    saved_fund = stock_map.get(ticker, {})
+                    graham_num = saved_fund.get('graham_number') or 0
+                    
+                    mos = 0
+                    status = "Neutral"
+                    if graham_num > 0 and price > 0:
+                        mos = ((graham_num - price) / graham_num) * 100
+                        status = "Undervalued" if mos > 0 else "Overvalued"
+                        
+                    updates.append({
+                        "ticker": ticker,
+                        "last_price": price,
+                        "daily_volume": vol,
+                        "margin_of_safety": mos,
+                        "valuation_status": status,
+                        "updated_at": "now()"
+                    })
+                    
+                except Exception as inner_e:
+                    # Error parsing per saham (wajar kalau ada saham delisting)
+                    continue
+
+            # Simpan ke Database
+            if updates:
+                supabase.table("stocks").upsert(updates, on_conflict="ticker").execute()
+                print(f"✅ Saved {len(updates)} stocks.")
+            else:
+                print("⚠️ No Data.")
+                
+        except Exception as e:
+            print(f"❌ Batch Error: {e}")
+            
+        # Santai sejenak biar Yahoo ga nge-ban IP kita
+        time.sleep(1)
+
+if __name__ == "__main__":
+    update_market_yfinance()
