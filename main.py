@@ -46,40 +46,38 @@ def read_root():
 def get_stock_screener(
     sector: Optional[str] = None,
     status: Optional[str] = None,
-    sort_by: str = "ticker",    # Field yang mau disort
-    sort_order: str = "asc",    # Arah: 'asc' atau 'desc'
-    limit: int = 1000
+    limit: int = 3000
 ):
     try:
-        # Mapping dari Frontend ke Kolom Database
-        sort_map = {
-            "ticker": "ticker",
-            "company_name": "company_name",
-            "sector": "sector",
-            "last_price": "last_price",
-            "graham_number": "graham_number",
-            "margin_of_safety": "margin_of_safety",
-            "change_pct": "change_pct"
-        }
-        
-        # Ambil nama kolom asli, default ke ticker jika tidak ketemu
-        db_column = sort_map.get(sort_by, "ticker")
-        is_desc = (sort_order.lower() == "desc")
-
+        # Base query
         query = supabase.table("stocks").select("*")
 
-        # Filter
+        # Filters
         if sector:
             query = query.eq("sector", sector)
         if status:
             query = query.eq("valuation_status", status)
+
+        # Bypass Supabase's 1000 max_rows hard limit using loop ranges
+        all_data = []
+        page_size = 1000
+        
+        for i in range(5):  # Loop maksimal 5 kali (Kapasitas 5000 saham)
+            start = i * page_size
+            end = start + page_size - 1
             
-        # Sorting Dinamis
-        # Supabase Python client menggunakan .order(column, desc=True/False)
-        query = query.order(db_column, desc=is_desc)
+            # Ambil data per rentang (0-999, 1000-1999, dst)
+            response = query.range(start, end).execute()
+            all_data.extend(response.data)
             
-        response = query.limit(limit).execute()
-        return {"data": response.data, "count": len(response.data)}
+            # Jika data yang didapat kurang dari 1000, berarti itu adalah halaman terakhir
+            if len(response.data) < page_size:
+                break
+                
+        # Potong sesuai parameter limit akhir (jika diminta spesifik)
+        result_data = all_data[:limit]
+        
+        return {"data": result_data, "count": len(result_data)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -148,7 +146,76 @@ def get_sectors():
     except Exception as e:
          raise HTTPException(status_code=500, detail=str(e))
 
-# --- TAMBAHKAN DI BAGIAN BAWAH MAIN.PY ---
+@app.get("/stats/heatmap")
+def get_market_heatmap():
+    """
+    Menghasilkan data hierarkis untuk Treemap / Market Heatmap.
+    Dikelompokkan berdasarkan Sektor. Ukuran = Turnover Value, Warna = Change Pct.
+    """
+    try:
+        # Ambil saham yang hari ini aktif (volume > 0) untuk menghindari error kalkulasi
+        stocks = supabase.table("stocks")\
+            .select("ticker, sector, last_price, daily_volume, change_pct")\
+            .gt("daily_volume", 0)\
+            .execute().data
+
+        tree = {}
+        for s in stocks:
+            sec = s.get('sector') or "Others"
+            if sec not in tree:
+                tree[sec] = []
+            
+            # Hitung estimasi nilai transaksi (Price * Volume) sebagai ukuran kotak
+            price = s.get('last_price') or 0
+            vol = s.get('daily_volume') or 0
+            val = price * vol
+            
+            if val > 0:
+                tree[sec].append({
+                    "name": s['ticker'],
+                    "size": val,
+                    "change": s.get('change_pct') or 0
+                })
+        
+        # Format ke array untuk Recharts Treemap
+        result = []
+        for sec, children in tree.items():
+            # Urutkan dari size terbesar, ambil maksimal 15 saham per sektor agar UI mulus
+            children = sorted(children, key=lambda x: x['size'], reverse=True)[:15]
+            if children:
+                result.append({
+                    "name": sec,
+                    "children": children
+                })
+                
+        return result
+    except Exception as e:
+        print(f"Heatmap Error: {e}")
+        return []
+
+@app.get("/news")
+def get_market_news(limit: int = 50, ticker: Optional[str] = None, sentiment: Optional[str] = None):
+    """
+    Mengambil berita pasar yang sudah dianalisis oleh AI.
+    Bisa difilter berdasarkan emiten (ticker) atau sentimen.
+    """
+    try:
+        query = supabase.table("market_news").select("*").order("published_at", desc=True)
+        
+        # Filter berdasarkan sentiment jika diminta
+        if sentiment and sentiment.upper() != "ALL":
+            query = query.eq("sentiment", sentiment.upper())
+            
+        # Filter JSONB array jika mencari ticker spesifik
+        if ticker:
+            # Menggunakan operator JSONB contains di Supabase
+            query = query.contains("affected_tickers", [ticker.upper()])
+            
+        res = query.limit(limit).execute()
+        return {"data": res.data}
+    except Exception as e:
+        print(f"Error fetch news: {e}")
+        return {"data": []}
 
 @app.get("/stats/dashboard-widgets")
 def get_dashboard_widgets():
