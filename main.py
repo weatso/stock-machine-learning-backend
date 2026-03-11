@@ -217,6 +217,41 @@ def get_market_news(limit: int = 50, ticker: Optional[str] = None, sentiment: Op
         print(f"Error fetch news: {e}")
         return {"data": []}
 
+@app.get("/stocks/profile/{ticker}")
+def get_stock_profile(ticker: str):
+    clean_ticker = ticker.upper().strip()
+    try:
+        # 1. Tarik Data Utama & Fundamental
+        stock_res = supabase.table("stocks").select("*").eq("ticker", clean_ticker).execute()
+        
+        if not stock_res.data or len(stock_res.data) == 0:
+            raise HTTPException(status_code=404, detail="Emiten tidak ditemukan di database.")
+            
+        stock_data = stock_res.data[0]
+        
+        # 2. Tarik Berita AI (Perbaikan format JSONB Query)
+        # Supabase API lebih stabil menerima string JSON untuk filter array JSONB
+        json_filter = f'["{clean_ticker}"]'
+        
+        news_res = supabase.table("market_news")\
+            .select("title, link, published_at, source, sentiment, insight")\
+            .contains("affected_tickers", json_filter)\
+            .order("published_at", desc=True)\
+            .limit(5)\
+            .execute()
+            
+        # Gabungkan data
+        stock_data["ai_news"] = news_res.data if news_res.data else []
+        
+        return stock_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        # INI ADALAH LOG YANG SEHARUSNYA ANDA BACA:
+        print(f"❌ FATAL ERROR fetch profile {clean_ticker}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan internal server: {str(e)}")
+
 @app.get("/stats/dashboard-widgets")
 def get_dashboard_widgets():
     """
