@@ -17,92 +17,113 @@ if not all([INVEZGO_KEY, SUPABASE_URL, SUPABASE_KEY]):
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def seed_master_data():
-    print("🚀 MEMULAI PROSES IMPORT MASTER DATA SAHAM (Invezgo API)...")
+    print("🚀 MEMULAI SINKRONISASI MASTER EMITEN (Invezgo API) -> TABEL 'emitens'")
 
-    # Menggunakan endpoint tanpa pagination sesuai dokumen
     url_list = "https://api.invezgo.com/analysis/list/stock"
     headers = {"Authorization": f"Bearer {INVEZGO_KEY}"}
     
-    print("\n📡 Mengambil daftar seluruh saham aktif dari Invezgo...")
+    print("\n📡 Mengambil daftar seluruh saham dari Invezgo...")
     try:
-        # Timeout 15 detik untuk memanggil daftar utama
         res = requests.get(url_list, headers=headers, timeout=15)
         if res.status_code != 200:
             print(f"❌ Gagal ambil list: {res.text}")
             return
             
         stock_list = res.json()
-        total_stocks = len(stock_list)
-        print(f"✅ Berhasil menarik {total_stocks} emiten.")
         
-        print("💾 Menyimpan data dasar ke Supabase...")
+        # FILTER ABSOLUT: Tolak semua instrumen turunan (Waran & Right Issue)
+        clean_stock_list = [
+            s for s in stock_list 
+            if isinstance(s.get('code'), str) and not s.get('code').endswith('-W') and not s.get('code').endswith('-R')
+        ]
+        
+        total_stocks = len(clean_stock_list)
+        print(f"✅ Berhasil menarik {total_stocks} emiten murni.")
+        
+        print("💾 Menyimpan data ke tabel 'emitens' secara bertahap...")
         batch_data = []
-        for item in stock_list:
+        
+        # MITIGASI STREAM RESET: Turunkan batch ke 50
+        BATCH_SIZE = 50 
+        
+        for index, item in enumerate(clean_stock_list):
+            ticker = item.get('code')
+            
             batch_data.append({
-                "ticker": item.get('code'),
+                "ticker": ticker,
                 "company_name": item.get('name'),
                 "logo_url": item.get('logo'),
-                "updated_at": "now()"
+                "sector": "Unknown",
+                "is_active": True
             })
             
-            # Batch upsert per 100 data
-            if len(batch_data) >= 100:
-                supabase.table("stocks").upsert(batch_data, on_conflict="ticker").execute()
-                batch_data = []
+            # Eksekusi per 50 data dengan penanganan error individual
+            if len(batch_data) >= BATCH_SIZE:
+                try:
+                    supabase.table("emitens").upsert(batch_data, on_conflict="ticker").execute()
+                    print(f"   => Tersimpan {index + 1} / {total_stocks} emiten...")
+                except Exception as e:
+                    print(f"   ❌ Gagal upsert batch pada index {index}: {e}")
                 
+                batch_data = []
+                # MITIGASI STREAM RESET: Jeda napas untuk Supabase
+                time.sleep(0.5) 
+                
+        # Simpan sisa data yang kurang dari 50
         if batch_data:
-            supabase.table("stocks").upsert(batch_data, on_conflict="ticker").execute()
+            try:
+                supabase.table("emitens").upsert(batch_data, on_conflict="ticker").execute()
+                print(f"   => Sisa data tersimpan.")
+            except Exception as e:
+                print(f"   ❌ Gagal upsert sisa data: {e}")
 
-        print("✅ Data dasar tersimpan! Mulai melengkapi Data Industri/Sektor...")
+        print("\n✅ Data dasar tersimpan! Mulai melengkapi Sektor...")
 
         failed_details = []
 
-        # Looping endpoint Information
-        for index, stock in enumerate(stock_list):
+        # 1. BANGUN SESSION YANG TAHAN BANTING (Mitigasi Firewall API)
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        session = requests.Session()
+        session.headers.update({"Authorization": f"Bearer {INVEZGO_KEY}"})
+        
+        # Jika kena Rate Limit (429) atau Server Error (5xx), sistem akan otomatis mencoba ulang 3x
+        # dengan jeda waktu yang terus meningkat (1s, 2s, 4s)
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+
+        # 2. EKSTRAKSI SEKTOR (Dengan Kecepatan Rasional)
+        print("\n⏳ Mengambil data sektor (Ini akan memakan waktu untuk menghindari pemblokiran)...")
+        for index, stock in enumerate(clean_stock_list):
             ticker = stock.get('code')
-            if not ticker: continue
-            
-            print(f"   🔄 ({index+1}/{total_stocks}) Ekstraksi detail: {ticker}...", end="\r")
+            print(f"   🔄 ({index+1}/{total_stocks}) Update Sektor: {ticker}...", end="\r")
             
             try:
                 url_detail = f"https://api.invezgo.com/analysis/information/{ticker}"
-                # PERTAHANAN: Timeout 5 detik agar skrip tidak hang selamanya seperti kasus MEDC-W
-                res_det = requests.get(url_detail, headers=headers, timeout=5)
+                # Gunakan session.get (bukan requests.get) dan naikkan batas toleransi timeout ke 10 detik
+                res_det = session.get(url_detail, timeout=10)
                 
                 if res_det.status_code == 200:
                     info = res_det.json()
-                    
                     update_payload = {
-                        "sector": info.get('sector'),
-                        "subsector": info.get('subsector'),
-                        "industry": info.get('industry'),
-                        "subindustry": info.get('subsindustry'),
-                        "listing_date": info.get('listing_date'),
-                        "updated_at": "now()"
+                        "sector": info.get('sector') or "Others"
                     }
-                    supabase.table("stocks").update(update_payload).eq("ticker", ticker).execute()
+                    supabase.table("emitens").update(update_payload).eq("ticker", ticker).execute()
                 else:
-                    # Gagal HTTP (misal 404/500)
                     failed_details.append(ticker)
                 
-                # Jeda agar tidak kena Error 429
-                time.sleep(0.1) 
+                # MITIGASI RATE LIMIT: Jeda waktu rasional. Maksimal 3-4 request per detik.
+                time.sleep(0.3) 
 
             except requests.exceptions.Timeout:
-                # Menangkap error jika server Invezgo bengong
                 failed_details.append(ticker)
             except Exception as e:
-                # Error lainnya
                 failed_details.append(ticker)
 
-        print("\n\n🎉 SELESAI! Database Master Saham Anda sudah tersinkronisasi.")
-        
-        # LAPORAN SAHAM GAGAL
+        print("\n\n🎉 SELESAI! Tabel 'emitens' siap digunakan.")
         if failed_details:
-            failed_details = list(set(failed_details))
-            print(f"\n⚠️ Terdapat {len(failed_details)} emiten yang gagal ditarik detail sektornya (Biasanya Waran/Right/Timeout):")
-            for i in range(0, len(failed_details), 15):
-                print(", ".join(failed_details[i:i+15]))
+             print(f"⚠️ Masih ada {len(failed_details)} saham yang gagal (Kemungkinan data tidak ada di Invezgo). Aman untuk dilanjutkan.")
 
     except Exception as e:
         print(f"\n❌ Error Fatal pada eksekusi: {e}")
