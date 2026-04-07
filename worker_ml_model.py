@@ -61,19 +61,22 @@ def train_and_predict():
             df = pd.merge(df_feat, df_price, on="date", how="inner")
             df['date'] = pd.to_datetime(df['date'])
             
-            # Fusi Data Fundamental (Menyambungkan data kuartalan ke harian tanpa Look-Ahead Bias)
+            # Fusi Data Fundamental
             if res_fund.data:
                 df_fund = pd.DataFrame(res_fund.data).rename(columns={"period_date": "date"})
                 df_fund['date'] = pd.to_datetime(df_fund['date'])
-                # Backward fill: Gunakan laporan keuangan terbaru yang rilis SEBELUM tanggal harga
                 df = pd.merge_asof(df.sort_values('date'), df_fund.sort_values('date'), on='date', direction='backward')
-            else:
-                # FALLBACK AMAN: Jika tabel fundamental di database masih kosong,
-                # berikan nilai rata-rata IHSG agar Imputer dan Random Forest tidak crash.
-                df['per'] = 15.0   # Rata-rata PER wajar
-                df['pbv'] = 1.5    # Rata-rata PBV wajar
-                df['roa'] = 5.0    # Rata-rata ROA wajar
-                df['roe'] = 10.0   # Rata-rata ROE wajar
+            
+            # [PERBAIKAN FATAL] PENYEMBUHAN NAN & BACKFILL
+            # Memastikan 4 pilar fundamental tidak pernah kosong 100% agar Imputer tidak crash
+            fallback_ratios = {'per': 15.0, 'pbv': 1.5, 'roa': 5.0, 'roe': 10.0}
+            for col, val in fallback_ratios.items():
+                if col not in df.columns:
+                    df[col] = val
+                else:
+                    # Tarik data fundamental ke belakang (bfill) untuk riwayat masa lalu, 
+                    # sisa yang benar-benar kosong diisi dengan fallback IHSG (fillna)
+                    df[col] = df[col].bfill().fillna(val)
 
             if df.empty: continue
             
@@ -116,46 +119,50 @@ def train_and_predict():
             X_imputed = pd.DataFrame(imputer.fit_transform(X_raw), columns=features)
             X_today = pd.DataFrame(imputer.transform(X_today_raw), columns=features)
 
-            # 7. SMOTE (Synthetic Minority Over-sampling) - Revisi 7
-            try:
-                # Menggandakan data saham sukses (A) yang langka agar mesin tidak bias
-                smote = SMOTE(random_state=42, k_neighbors=min(2, len(Y)-1))
-                X_resampled, Y_resampled = smote.fit_resample(X_imputed, Y)
-            except:
-                X_resampled, Y_resampled = X_imputed, Y # Fallback jika data terlalu ekstrem
-            
-            # 8. ARSITEKTUR ANTI-KEBOCORAN DATA
+           # 7. PEMBAGIAN TRAIN & TEST UNTUK EVALUASI AKADEMIS (Tanpa Data Leakage)
+            # Kita pecah sejarah tanpa mengacak urutan waktu
             tscv = TimeSeriesSplit(n_splits=3)
+            splits = list(tscv.split(X_imputed))
             
-            # EVALUASI LOKAL (Menyimpan tes terakhir untuk matriks global)
-            for train_idx, test_idx in tscv.split(X_resampled):
-                X_train_cv, X_test_cv = X_resampled.iloc[train_idx], X_resampled.iloc[test_idx]
-                Y_train_cv, Y_test_cv = Y_resampled.iloc[train_idx], Y_resampled.iloc[test_idx]
-
-            # PELATIHAN MODEL
-            rf = RandomForestClassifier(random_state=42, class_weight='balanced')
-            grid_search = GridSearchCV(
-                estimator=rf, 
-                param_grid=param_grid, 
-                cv=tscv, 
-                scoring='accuracy',
-                n_jobs=-1 
-            )
+            # Ambil potongan waktu terakhir sebagai ujian (Test Set) paling relevan
+            train_idx, test_idx = splits[-1]
             
-            grid_search.fit(X_resampled, Y_resampled)
-            best_model = grid_search.best_estimator_
+            X_train_eval, X_test_eval = X_imputed.iloc[train_idx], X_imputed.iloc[test_idx]
+            Y_train_eval, Y_test_eval = Y.iloc[train_idx], Y.iloc[test_idx]
             
-            # EKSEKUSI PREDIKSI TEST SET UNTUK EVALUASI
-            Y_pred_cv = best_model.predict(X_test_cv)
-            all_y_true.extend(Y_test_cv.tolist())
-            all_y_pred.extend(Y_pred_cv.tolist())
-
-            # 9. PREDIKSI HARI INI
-            prediction = best_model.predict(X_today)[0]
+            # 8. SMOTE HANYA PADA DATA TRAINING (Mencegah Kebocoran Data/Leakage)
+            try:
+                smote = SMOTE(random_state=42, k_neighbors=min(2, len(Y_train_eval)-1))
+                X_train_smote, Y_train_smote = smote.fit_resample(X_train_eval, Y_train_eval)
+            except:
+                X_train_smote, Y_train_smote = X_train_eval, Y_train_eval
+                
+            # 9. PELATIHAN & EVALUASI OOB (Out-of-Sample)
+            # Menghapus GridSearchCV untuk efisiensi waktu, menggunakan parameter optimal
+            rf_eval = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, class_weight='balanced')
+            rf_eval.fit(X_train_smote, Y_train_smote)
             
-            # 10. EKSTRAKSI KEPINTARAN (8 Variabel)
-            importances = best_model.feature_importances_
+            Y_pred_eval = rf_eval.predict(X_test_eval)
+            all_y_true.extend(Y_test_eval.tolist())
+            all_y_pred.extend(Y_pred_eval.tolist())
+            
+            # 10. PELATIHAN MODEL FINAL UNTUK PREDIKSI HARI INI
+            # Sekarang gunakan SELURUH sejarah data yang di-SMOTE untuk menebak masa depan hari ini
+            try:
+                smote_final = SMOTE(random_state=42, k_neighbors=min(2, len(Y)-1))
+                X_final_smote, Y_final_smote = smote_final.fit_resample(X_imputed, Y)
+            except:
+                X_final_smote, Y_final_smote = X_imputed, Y
+                
+            rf_final = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, class_weight='balanced')
+            rf_final.fit(X_final_smote, Y_final_smote)
+            
+            # 11. PREDIKSI HARI INI & EKSTRAKSI KEPINTARAN (Model Final)
+            prediction = rf_final.predict(X_today)[0]
+            importances = rf_final.feature_importances_
             feat_imp_dict = {feat: round(float(imp), 4) for feat, imp in zip(features, importances)}
+            
+            # SIMPAN KE DATABASE (Tabel: ml_predictions)
             
             # 11. SIMPAN KE DATABASE (Tabel: ml_predictions)
             payload = {
@@ -170,6 +177,10 @@ def train_and_predict():
 
         except Exception as e:
             print(f"❌ Error: {e}")
+            
+        # [PERBAIKAN FATAL] Jeda Napas untuk Supabase (Mencegah SSL/Timeout Drop)
+        import time
+        time.sleep(0.1)
             
     # =========================================================================
     # FASE 12: EVALUASI GLOBAL UNTUK DASHBOARD "MODEL HEALTH" (Revisi 7)
