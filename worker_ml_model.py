@@ -11,8 +11,14 @@ from dotenv import load_dotenv
 from utils import supabase, get_all_tickers
 import warnings
 
+import sys
+
 warnings.filterwarnings('ignore')
 load_dotenv()
+
+# Fix for Windows console emoji printing
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
 
 def train_and_predict():
     tickers = get_all_tickers()
