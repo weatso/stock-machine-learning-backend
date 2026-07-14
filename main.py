@@ -60,3 +60,10 @@ def get_stock_detail(ticker: str):
     except Exception as e:
         print(f"❌ API ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    
+    # Ambil PORT dari Railway, default ke 8080 jika tidak ada
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
